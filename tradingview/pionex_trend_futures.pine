@@ -1,0 +1,112 @@
+//@version=6
+// ============================================================================
+//  PX Trend Futures — EMA 交叉 + 200 EMA 趨勢 + ADX 過濾 + ATR 止蝕/止盈
+//  用途：TradingView 策略 → Alert Webhook → Pionex 信號機器人 (Signal Bot) 自動開平合約
+//
+//  重點設計：
+//   * 只用「已收盤 K 線」計算信號 (calc_on_every_tick=false)，唔會 repaint
+//   * pyramiding=0：同一時間最多一張單，方便 Pionex 跟 position_size 同步
+//   * 所有開倉 / 平倉 / 止蝕 / 止盈都係 strategy 訂單，所以
+//     Alert 揀「Order fills only」就會自動將每個動作推送去 Pionex
+//   * 訂單 id / comment 全部用英文，避免 JSON 出問題
+// ============================================================================
+strategy("PX Trend Futures (EMA+ADX+ATR)", shorttitle = "PX-Trend", overlay = true,
+     initial_capital = 1000, default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     slippage = 2, pyramiding = 0, calc_on_every_tick = false,
+     process_orders_on_close = false, margin_long = 10, margin_short = 10)
+
+// ─── Inputs ────────────────────────────────────────────────────────────────
+grpT = "趨勢 Trend"
+fastLen  = input.int(21,  "快 EMA",            minval = 1, group = grpT)
+slowLen  = input.int(55,  "慢 EMA",            minval = 1, group = grpT)
+trendLen = input.int(200, "趨勢 EMA",          minval = 1, group = grpT)
+useTrend = input.bool(true, "只順趨勢 EMA 方向開倉", group = grpT)
+
+grpA = "ADX 過濾 (避開橫行)"
+useAdx = input.bool(true, "啟用 ADX 過濾", group = grpA)
+adxLen = input.int(14, "ADX 長度", minval = 1, group = grpA)
+adxThr = input.float(20, "ADX 最低值", minval = 0, group = grpA)
+
+grpR = "風險管理 Risk"
+atrLen    = input.int(14, "ATR 長度", minval = 1, group = grpR)
+slMult    = input.float(2.0, "止蝕距離 = ATR ×", minval = 0.1, step = 0.1, group = grpR)
+tpMult    = input.float(3.0, "止盈距離 = ATR ×", minval = 0.1, step = 0.1, group = grpR)
+useTrail  = input.bool(false, "用移動止蝕代替固定止盈", group = grpR)
+trailMult = input.float(2.5, "移動止蝕距離 = ATR ×", minval = 0.1, step = 0.1, group = grpR)
+riskPct   = input.float(1.0, "每單最多虧 % 本金", minval = 0.1, maxval = 10, step = 0.1, group = grpR)
+maxLev    = input.float(5, "倉位上限 (名義價值 / 本金)", minval = 1, maxval = 10, step = 0.5, group = grpR)
+
+grpD = "方向 / 時間"
+allowLong  = input.bool(true, "允許做多 Long",  group = grpD)
+allowShort = input.bool(true, "允許做空 Short", group = grpD)
+startTime  = input.time(timestamp("2023-01-01 00:00 +0000"), "回測開始日期", group = grpD)
+
+// ─── Indicators ────────────────────────────────────────────────────────────
+emaFast  = ta.ema(close, fastLen)
+emaSlow  = ta.ema(close, slowLen)
+emaTrend = ta.ema(close, trendLen)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+atr = ta.atr(atrLen)
+
+ready   = time >= startTime and not na(atr) and not na(adx) and bar_index > trendLen
+adxOk   = not useAdx or adx > adxThr
+crossUp = ta.crossover(emaFast, emaSlow)
+crossDn = ta.crossunder(emaFast, emaSlow)
+
+longSig  = ready and allowLong  and crossUp and (not useTrend or close > emaTrend) and adxOk
+shortSig = ready and allowShort and crossDn and (not useTrend or close < emaTrend) and adxOk
+
+// 風險倉位：止蝕觸發時最多虧 riskPct% 本金，並受 maxLev 上限限制
+calcQty() =>
+    stopDist = atr * slMult
+    riskQty  = strategy.equity * riskPct / 100 / stopDist
+    capQty   = strategy.equity * maxLev / close
+    math.max(math.min(riskQty, capQty), 0)
+
+// ─── Entries (反向信號會直接反手) ──────────────────────────────────────────
+var float longSL  = na
+var float longTP  = na
+var float shortSL = na
+var float shortTP = na
+
+if longSig and strategy.position_size <= 0
+    longSL := close - atr * slMult
+    longTP := close + atr * tpMult
+    strategy.entry("Long", strategy.long, qty = calcQty(), comment = "OpenLong")
+
+if shortSig and strategy.position_size >= 0
+    shortSL := close + atr * slMult
+    shortTP := close - atr * tpMult
+    strategy.entry("Short", strategy.short, qty = calcQty(), comment = "OpenShort")
+
+// 反向交叉但唔反手 (例如關咗做空) → 直接平倉
+if strategy.position_size > 0 and crossDn and not shortSig
+    strategy.close("Long", comment = "CloseLong")
+if strategy.position_size < 0 and crossUp and not longSig
+    strategy.close("Short", comment = "CloseShort")
+
+// ─── Exits: 止蝕 + 止盈 / 移動止蝕 ─────────────────────────────────────────
+trailTicks = atr * trailMult / syminfo.mintick
+if useTrail
+    strategy.exit("XL", from_entry = "Long",  stop = longSL,  trail_price = longTP,  trail_offset = trailTicks, comment = "ExitLong")
+    strategy.exit("XS", from_entry = "Short", stop = shortSL, trail_price = shortTP, trail_offset = trailTicks, comment = "ExitShort")
+else
+    strategy.exit("XL", from_entry = "Long",  stop = longSL,  limit = longTP,  comment = "ExitLong")
+    strategy.exit("XS", from_entry = "Short", stop = shortSL, limit = shortTP, comment = "ExitShort")
+
+// ─── Visuals ───────────────────────────────────────────────────────────────
+plot(emaFast,  "快 EMA",   color = color.new(color.aqua, 0))
+plot(emaSlow,  "慢 EMA",   color = color.new(color.orange, 0))
+plot(emaTrend, "趨勢 EMA", color = color.new(color.gray, 0), linewidth = 2)
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+plot(inLong  ? longSL  : na, "多單止蝕", color = color.red,   style = plot.style_linebr)
+plot(inLong  ? longTP  : na, "多單止盈", color = color.green, style = plot.style_linebr)
+plot(inShort ? shortSL : na, "空單止蝕", color = color.red,   style = plot.style_linebr)
+plot(inShort ? shortTP : na, "空單止盈", color = color.green, style = plot.style_linebr)
+
+plotshape(longSig,  "Long 信號",  shape.triangleup,   location.belowbar, color.green, size = size.small)
+plotshape(shortSig, "Short 信號", shape.triangledown, location.abovebar, color.red,   size = size.small)
+bgcolor(useAdx and adx <= adxThr ? color.new(color.gray, 92) : na, title = "ADX 太低 (橫行)")
